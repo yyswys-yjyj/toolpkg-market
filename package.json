@@ -1,0 +1,12 @@
+{
+  "name": "com.operit.toolpkg_market",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Toolpkg Market - browse/install/manage Operit market packages",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
