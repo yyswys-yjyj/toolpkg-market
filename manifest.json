@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "toolpkg_id": "com.operit.toolpkg_market",
-  "version": "v1.0.0",
+  "version": "1.0.0",
   "author": ["yyswys-yjyj"],
   "main": "dist/registry.js",
   "display_name": {
