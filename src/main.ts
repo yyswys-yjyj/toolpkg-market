@@ -263,6 +263,33 @@
           "required": false
         }
       ]
+    },
+    {
+      "name": "market_cache",
+      "description": {
+        "zh": "管理市场本地缓存（搜索索引 + 包详情）。\n参数：\n- action（可选）：clear（使缓存失效，默认）/ status（查看缓存状态）。\n- scope（可选，仅 clear 时有效）：all（索引+详情，默认）/ index（仅搜索索引）/ detail（仅详情）。\n用途：市场数据默认缓存 6 小时，当你需要强制拉取最新数据时，可先 clear 使缓存失效，下次查询将重新走网络。",
+        "en": "Manage local market cache (search index + package details).\nParams:\n- action (optional): clear (invalidate cache, default) / status (show cache status).\n- scope (optional, clear only): all (index+details, default) / index (search index only) / detail (details only).\nPurpose: market data is cached for 6 hours by default; call clear to force a fresh network fetch on the next query."
+      },
+      "parameters": [
+        {
+          "name": "action",
+          "description": {
+            "zh": "clear（默认）使缓存失效 / status 查看缓存状态",
+            "en": "clear (default) to invalidate cache / status to show cache status"
+          },
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "scope",
+          "description": {
+            "zh": "clear 的范围：all（默认）/ index / detail",
+            "en": "clear scope: all (default) / index / detail"
+          },
+          "type": "string",
+          "required": false
+        }
+      ]
     }
   ]
 }
@@ -285,6 +312,7 @@ const MARKET_CACHE_DIR = "/storage/emulated/0/Download/Operit/cleanOnExit/toolpk
 const MARKET_CACHE_FILE = "search_index.json";
 const MARKET_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 小时缓存
 const MARKET_SEARCH_PAGES = 4; // 榜单每排序抓前 4 页
+const MARKET_FETCH_CONCURRENCY = 12; // 并发拉取上限（实测 12 路全开无触发限流，最快）
 
 function get_error_message(error) {
   return error instanceof Error ? error.message : "Unknown error";
@@ -572,24 +600,54 @@ async function writeDetailCache(id, detailObj) {
   }
 }
 
-// 构建搜索索引：网络拉取多排序榜单并合并（供本机缓存）
+// 并发池：限制同时进行的任务数（避免一次性发太多请求触发市场限流）
+async function runWithConcurrency(tasks, limit) {
+  const results = new Array(tasks.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (nextIndex < tasks.length) {
+      const i = nextIndex++;
+      try {
+        results[i] = { ok: true, value: await tasks[i]() };
+      } catch (e) {
+        results[i] = { ok: false, error: e };
+      }
+    }
+  }
+  const workerCount = Math.max(1, Math.min(limit, tasks.length));
+  const workers = [];
+  for (let w = 0; w < workerCount; w++) workers.push(worker());
+  await Promise.all(workers);
+  return results;
+}
+
+// 构建搜索索引：并发拉取多排序榜单并合并（供本机缓存）
+// 并发改造：原先 3 排序 × 4 页 = 12 次串行请求，改为受限并发（默认 6 路）
 async function buildSearchIndex() {
-  const all = [];
   const sortKeys = ["downloads", "likes", "updated"];
   const typeKey = "all";
+  const jobs = [];
   for (let si = 0; si < sortKeys.length; si++) {
     for (let pi = 1; pi <= MARKET_SEARCH_PAGES; pi++) {
-      let pageData = null;
-      try {
-        const segs = listPathSegments(typeKey, sortKeys[si], pi);
-        pageData = await fetchList(segs);
-      } catch (e) { break; }
+      jobs.push({ sort: sortKeys[si], page: pi });
+    }
+  }
+  const tasks = jobs.map(function (job) {
+    return async function () {
+      const segs = listPathSegments(typeKey, job.sort, job.page);
+      const pageData = await fetchList(segs);
       const items = (pageData && pageData.items) || [];
-      if (!items.length) break;
-      for (const item of items) {
-        const e = item && item.id ? item : (item.entry || item);
-        if (e && e.id) all.push(e);
-      }
+      return items;
+    };
+  });
+  const settled = await runWithConcurrency(tasks, MARKET_FETCH_CONCURRENCY);
+  const all = [];
+  for (let i = 0; i < settled.length; i++) {
+    const r = settled[i];
+    if (!r || !r.ok || !Array.isArray(r.value)) continue;
+    for (const item of r.value) {
+      const e = item && item.id ? item : (item.entry || item);
+      if (e && e.id) all.push(e);
     }
   }
   return { items: mergeItems([], all) };
@@ -988,9 +1046,167 @@ async function comment(params) {
   }
 }
 
+// ---- 缓存管理 ----
+
+// 列出缓存目录中的文件（仅文件名）
+async function listCacheFiles() {
+  try {
+    const r = await Tools.Files.list(MARKET_CACHE_DIR, "android");
+    const arr = (r && (r.entries || r.files || r.items)) || [];
+    const names = [];
+    if (Array.isArray(arr)) {
+      for (const f of arr) {
+        if (typeof f === "string") names.push(f);
+        else if (f && (f.name || f.path)) names.push(String(f.name || f.path));
+      }
+    }
+    return names;
+  } catch (e) {
+    return [];
+  }
+}
+
+// 列出缓存目录条目（含大小，用于体积统计）
+async function listCacheEntries() {
+  try {
+    const r = await Tools.Files.list(MARKET_CACHE_DIR, "android");
+    const arr = (r && (r.entries || r.files || r.items)) || [];
+    const out = [];
+    if (Array.isArray(arr)) {
+      for (const f of arr) {
+        if (typeof f === "string") out.push({ name: f, size: 0 });
+        else if (f && (f.name || f.path)) out.push({ name: String(f.name || f.path), size: Number(f.size) || 0 });
+      }
+    }
+    return out;
+  } catch (e) {
+    return [];
+  }
+}
+
+// 删除缓存文件（返回是否成功）
+async function deleteCacheFile(name) {
+  try {
+    const r = await Tools.Files.deleteFile(MARKET_CACHE_DIR + "/" + name, "android");
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// 读取缓存状态（大小/时间/数量）
+async function cacheStatus() {
+  const entries = await listCacheEntries();
+  let indexMeta = { name: MARKET_CACHE_FILE, size: 0 };
+  const detailFiles = [];
+  let hasIndex = false;
+  for (const en of entries) {
+    if (en.name === MARKET_CACHE_FILE) { hasIndex = true; indexMeta = en; }
+    else if (en.name.indexOf("detail_") === 0 && en.name.slice(-5) === ".json") detailFiles.push(en);
+  }
+  let indexInfo = null;
+  if (hasIndex) {
+    try {
+      const res = await Tools.Files.read({ path: MARKET_CACHE_DIR + "/" + MARKET_CACHE_FILE, environment: "android" });
+      if (res && res.content) {
+        const data = JSON.parse(stripLinePrefixes(String(res.content)));
+        if (data) {
+          const ageMs = data.fetchedAt ? (Date.now() - data.fetchedAt) : null;
+          indexInfo = {
+            fetchedAt: data.fetchedAt || null,
+            ageMinutes: ageMs === null ? null : Math.floor(ageMs / 60000),
+            expired: ageMs === null ? true : (ageMs > MARKET_CACHE_TTL_MS),
+            items: Array.isArray(data.items) ? data.items.length : 0
+          };
+        }
+      }
+    } catch (e) {
+      indexInfo = { error: get_error_message(e) };
+    }
+  }
+  let detailBytes = 0;
+  for (const d of detailFiles) detailBytes += d.size;
+  return {
+    dir: MARKET_CACHE_DIR,
+    ttlMinutes: Math.floor(MARKET_CACHE_TTL_MS / 60000),
+    indexFile: hasIndex ? MARKET_CACHE_FILE : null,
+    indexBytes: indexMeta.size,
+    index: indexInfo,
+    detailCount: detailFiles.length,
+    detailBytes: detailBytes
+  };
+}
+
+// 使缓存失效（clear）
+async function clearCache(scope) {
+  const names = await listCacheFiles();
+  let removed = 0;
+  let kept = 0;
+  const removedNames = [];
+  for (const n of names) {
+    let shouldDelete = false;
+    if (scope === "index") {
+      shouldDelete = (n === MARKET_CACHE_FILE || n === MARKET_CACHE_FILE + ".tmp");
+    } else if (scope === "detail") {
+      shouldDelete = (n.indexOf("detail_") === 0);
+    } else {
+      // all：索引 + 详情（不动 pending/其它）
+      shouldDelete = (n === MARKET_CACHE_FILE || n === MARKET_CACHE_FILE + ".tmp" || n.indexOf("detail_") === 0);
+    }
+    if (shouldDelete) {
+      const ok = await deleteCacheFile(n);
+      if (ok) { removed++; removedNames.push(n); }
+      else kept++;
+    } else {
+      kept++;
+    }
+  }
+  return { scope: scope, removed: removed, kept: kept, removedNames: removedNames };
+}
+
+async function market_cache(params) {
+  try {
+    const action = String((params && params.action) || "clear").trim().toLowerCase();
+    let scope = String((params && params.scope) || "all").trim().toLowerCase();
+    if (["all", "index", "detail"].indexOf(scope) < 0) scope = "all";
+
+    if (action === "status") {
+      const st = await cacheStatus();
+      const kb = function (n) { return (n / 1024).toFixed(1) + " KB"; };
+      const lines = [];
+      lines.push("缓存目录：" + st.dir);
+      lines.push("TTL：" + st.ttlMinutes + " 分钟");
+      if (st.index) {
+        lines.push("搜索索引：" + st.index.items + " 条 / " + kb(st.indexBytes) + "，抓取于 " + (st.index.ageMinutes === null ? "未知" : st.index.ageMinutes + " 分钟前") + "，" + (st.index.expired ? "已过期" : "有效"));
+      } else {
+        lines.push("搜索索引：不存在");
+      }
+      lines.push("详情缓存：" + st.detailCount + " 个" + (st.detailBytes > 0 ? " / " + kb(st.detailBytes) : ""));
+      complete({ success: true, message: "市场缓存状态：\n" + lines.join("\n"), data: st });
+      return;
+    }
+
+    if (action === "clear") {
+      const r = await clearCache(scope);
+      const scopeLabel = scope === "all" ? "全部（索引+详情）" : (scope === "index" ? "仅搜索索引" : "仅详情");
+      if (r.removed === 0) {
+        complete({ success: true, message: "缓存（" + scopeLabel + "）本就为空，无需清理。", data: r });
+      } else {
+        complete({ success: true, message: "已使缓存失效（" + scopeLabel + "）：清理 " + r.removed + " 个文件。下次查询将走网络重建。", data: r });
+      }
+      return;
+    }
+
+    complete({ success: false, message: "action 仅支持：clear / status" });
+  } catch (e) {
+    complete({ success: false, message: "缓存操作失败：" + get_error_message(e) });
+  }
+}
+
 exports.market_search = market_search;
 exports.market_detail = market_detail;
 exports.market_comments = market_comments;
 exports.market_top = market_top;
 exports.market_author = market_author;
 exports.comment = comment;
+exports.market_cache = market_cache;
